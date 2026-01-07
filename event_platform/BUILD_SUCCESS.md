@@ -43,8 +43,6 @@ These fields are intentionally kept for metadata and future use:
 - `EventMetadata.image_url` - Event image URL
 - `EventMetadata.tags` - Event categorization tags
 - `EventConfig.requires_approval` - Future approval workflow
-- `PlatformAdminCap.admin_level` - Admin hierarchy levels
-- `PlatformAdminCap.granted_at` - Timestamp tracking
 
 ### Unused Constants (4 warnings)
 Reserved for future features:

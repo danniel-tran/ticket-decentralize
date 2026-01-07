@@ -8,7 +8,6 @@ A comprehensive decentralized event and ticketing platform built on Sui blockcha
 **Purpose:** Manages capabilities and permissions
 
 **Key Structs:**
-- `PlatformAdminCap` - Platform admin capability
 - `EventOrganizerCap` - Event organizer capability with granular permissions
 - `ValidatorCap` - Ticket validator capability for check-ins
 - `MultiSigOrganizer` - Multi-signature support for co-organized events

@@ -13,14 +13,6 @@ const ADMIN_LEVEL_SUPER_ADMIN: u8 = 0;
 const ADMIN_LEVEL_MODERATOR: u8 = 1;
 
 // ======== Structs ========
-
-/// Platform admin capability - for platform-wide operations
-public struct PlatformAdminCap has key {
-    id: UID,
-    admin_level: u8,
-    granted_at: u64,
-}
-
 /// Organizer permissions configuration
 public struct OrganizerPermissions has copy, drop, store {
     can_update_event: bool,

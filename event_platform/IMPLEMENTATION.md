@@ -23,7 +23,6 @@ Layer 6: payments.move        (Financial operations)
 **Purpose:** Capability-based permission system for all platform operations
 
 **Key Features:**
-- ✅ PlatformAdminCap for platform-wide administration
 - ✅ EventOrganizerCap with granular permissions
 - ✅ ValidatorCap for attendee check-ins
 - ✅ Expiration support for all capabilities
