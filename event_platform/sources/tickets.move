@@ -1,34 +1,31 @@
 /// Tickets Module
-/// Ticket NFT minting, validation, and transfers
+/// NFT ticketing with encrypted metadata and validation
 module event_platform::tickets;
 
-use event_platform::access_control::{Self, EventOrganizerCap, ValidatorCap};
-use event_platform::events::{Self, Event};
-use event_platform::payments::{Self, EventTreasury, PlatformTreasury, Payment};
-use std::option::{Self, Option};
 use std::string::String;
 use sui::coin::Coin;
-use sui::event;
-use sui::object::{Self, UID, ID};
 use sui::sui::SUI;
-use sui::transfer;
-use sui::tx_context::{Self, TxContext};
+use sui::event;
+use event_platform::events::{Self, Event};
+use event_platform::users::{Self, UserProfile, BadgeRegistry};
+use event_platform::payments::{Self, EventTreasury, PlatformTreasury};
+use event_platform::access_control::{Self, ValidatorCap};
 
-// === Error Codes ===
-const ENotAuthorized: u64 = 1;
-const EInvalidEvent: u64 = 2;
-const ETicketNotTransferable: u64 = 3;
-const EAlreadyValidated: u64 = 4;
-const ERefundNotAllowed: u64 = 5;
-const EInvalidQRHash: u64 = 6;
-const EPoolFull: u64 = 7;
+// ======== Error Codes ========
+const ENotAuthorized: u64 = 4000;
+const ERegistrationClosed: u64 = 4001;
+const EInsufficientPayment: u64 = 4002;
+const EInvalidEvent: u64 = 4003;
+const ERefundNotAllowed: u64 = 4004;
+const EAlreadyValidated: u64 = 4005;
+const EInsufficientBalance: u64 = 4006;
+const ETicketNotTransferable: u64 = 4007;
+const EInvalidQRHash: u64 = 4008;
+const EPoolExhausted: u64 = 4009;
 
-// === One-Time-Witness ===
-public struct TICKETS has drop {}
+// ======== Structs ========
 
-// === Main Structs ===
-
-/// Ticket NFT (owned by user)
+/// Ticket NFT (OWNED)
 public struct Ticket has key, store {
     id: UID,
     event_id: ID,
@@ -39,23 +36,21 @@ public struct Ticket has key, store {
     mint_time: u64,
 }
 
-/// Nested ticket metadata
-public struct TicketMetadata has drop, store {
+public struct TicketMetadata has store, drop {
     ticket_number: u64,
     tier: String,
-    encrypted_data: vector<u8>, // Seal encrypted
+    encrypted_data: vector<u8>,
     seal_key_id: String,
     qr_code_hash: vector<u8>,
 }
 
-/// Nested validation info
-public struct ValidationInfo has drop, store {
+public struct ValidationInfo has store, drop {
     is_validated: bool,
     validation_time: Option<u64>,
     validator_address: Option<address>,
 }
 
-/// Shared ticket pool for events
+/// Ticket pool for managing capacity (SHARED)
 public struct TicketPool has key {
     id: UID,
     event_id: ID,
@@ -63,13 +58,15 @@ public struct TicketPool has key {
     available: u64,
 }
 
-// === Event Logs ===
+// ======== Events ========
 
 public struct TicketMinted has copy, drop {
     ticket_id: ID,
     event_id: ID,
     owner: address,
     ticket_number: u64,
+    tier: String,
+    price_paid: u64,
     timestamp: u64,
 }
 
@@ -83,6 +80,7 @@ public struct TicketValidated has copy, drop {
 
 public struct TicketTransferred has copy, drop {
     ticket_id: ID,
+    event_id: ID,
     from: address,
     to: address,
     timestamp: u64,
@@ -96,53 +94,64 @@ public struct TicketRefunded has copy, drop {
     timestamp: u64,
 }
 
-// === Public Functions ===
+// ======== Public Functions ========
 
-/// Create ticket pool for an event
-public fun create_ticket_pool(event: &Event, cap: &EventOrganizerCap, ctx: &mut TxContext) {
-    // Verify organizer owns this event
-    assert!(access_control::verify_organizer(cap, object::id(event)), ENotAuthorized);
-
-    let config = events::get_event_config(event);
-    let pool = TicketPool {
+/// Create ticket pool for event
+public(package) fun create_ticket_pool(
+    event_id: ID,
+    capacity: u64,
+    ctx: &mut TxContext,
+): TicketPool {
+    TicketPool {
         id: object::new(ctx),
-        event_id: object::id(event),
+        event_id,
         total_minted: 0,
-        available: config.capacity,
-    };
-
-    transfer::share_object(pool);
+        available: capacity,
+    }
 }
 
-/// Mint ticket to user
+/// Mint ticket (purchase)
 public fun mint_ticket(
     pool: &mut TicketPool,
     event: &mut Event,
+    user_profile: &mut UserProfile,
     event_treasury: &mut EventTreasury,
     platform_treasury: &mut PlatformTreasury,
+    registry: &event_platform::events::EventRegistry,
     payment: Coin<SUI>,
     tier: String,
     encrypted_data: vector<u8>,
     seal_key_id: String,
     qr_code_hash: vector<u8>,
-    platform_fee_percent: u64,
     ctx: &mut TxContext,
-): (Ticket, Payment) {
-    // Verify pool matches event
-    assert!(pool.event_id == object::id(event), EInvalidEvent);
-    assert!(pool.event_id == payments::get_treasury_event_id(event_treasury), EInvalidEvent);
+): Ticket {
+    let sender = tx_context::sender(ctx);
 
-    // Check availability
-    assert!(pool.available > 0, EPoolFull);
+    // Verify profile owner
+    assert!(users::get_owner(user_profile) == sender, ENotAuthorized);
 
-    let owner = tx_context::sender(ctx);
+    // Verify event is open and has capacity
+    assert!(events::can_register(event, ctx), ERegistrationClosed);
+
+    // Verify pool has tickets available
+    assert!(pool.available > 0, EPoolExhausted);
+
+    // Verify event IDs match
+    let event_id = object::id(event);
+    assert!(pool.event_id == event_id, EInvalidEvent);
+    assert!(payments::get_event_id(event_treasury) == event_id, EInvalidEvent);
+
+    // Verify payment amount
     let ticket_price = events::get_ticket_price(event);
+    let payment_value = sui::coin::value(&payment);
+    assert!(payment_value == ticket_price, EInsufficientPayment);
 
-    // Process payment
-    let payment_record = payments::process_payment(
+    // Process payment (split organizer + platform fee)
+    let platform_fee_percent = events::get_platform_fee_percent(registry);
+    payments::process_payment(
         event_treasury,
         platform_treasury,
-        owner,
+        sender,
         payment,
         ticket_price,
         platform_fee_percent,
@@ -150,276 +159,248 @@ public fun mint_ticket(
     );
 
     // Register attendee in event
-    events::register_attendee(event, owner, ctx);
+    events::register_attendee(event, sender, ctx);
 
     // Add revenue to event stats
     events::add_revenue(event, ticket_price);
+
+    // Update user stats
+    users::increment_tickets_purchased(user_profile);
+    users::add_total_spent(user_profile, ticket_price);
 
     // Update pool
     pool.total_minted = pool.total_minted + 1;
     pool.available = pool.available - 1;
 
-    // Create ticket metadata
-    let metadata = TicketMetadata {
-        ticket_number: pool.total_minted,
-        tier,
-        encrypted_data,
-        seal_key_id,
-        qr_code_hash,
-    };
-
-    // Create validation info
-    let validation = ValidationInfo {
-        is_validated: false,
-        validation_time: option::none(),
-        validator_address: option::none(),
-    };
-
-    // Create ticket NFT
-    let ticket_uid = object::new(ctx);
-    let ticket_id = object::uid_to_inner(&ticket_uid);
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-
-    let ticket = Ticket {
-        id: ticket_uid,
-        event_id: pool.event_id,
-        owner,
-        original_owner: owner,
-        metadata,
-        validation,
-        mint_time: current_time,
-    };
+    // Create ticket
+    let ticket_id = object::new(ctx);
+    let timestamp = tx_context::epoch_timestamp_ms(ctx);
 
     event::emit(TicketMinted {
-        ticket_id,
-        event_id: pool.event_id,
-        owner,
+        ticket_id: object::uid_to_inner(&ticket_id),
+        event_id,
+        owner: sender,
         ticket_number: pool.total_minted,
-        timestamp: current_time,
+        tier,
+        price_paid: ticket_price,
+        timestamp,
     });
 
-    (ticket, payment_record)
+    Ticket {
+        id: ticket_id,
+        event_id,
+        owner: sender,
+        original_owner: sender,
+        metadata: TicketMetadata {
+            ticket_number: pool.total_minted,
+            tier,
+            encrypted_data,
+            seal_key_id,
+            qr_code_hash,
+        },
+        validation: ValidationInfo {
+            is_validated: false,
+            validation_time: option::none(),
+            validator_address: option::none(),
+        },
+        mint_time: timestamp,
+    }
 }
 
-/// Validate ticket at check-in
+/// Validate ticket (check-in)
 public fun validate_ticket(
     ticket: &mut Ticket,
     event: &mut Event,
+    user_profile: &mut UserProfile,
+    badge_registry: &mut BadgeRegistry,
     validator_cap: &ValidatorCap,
-    ctx: &TxContext,
+    provided_qr_hash: vector<u8>,
+    ctx: &mut TxContext,
 ) {
-    // Verify validator has permission for this event
-    assert!(access_control::verify_validator(validator_cap, ticket.event_id), ENotAuthorized);
-    assert!(ticket.event_id == object::id(event), EInvalidEvent);
+    // Verify validator cap
+    access_control::verify_validator(validator_cap, ticket.event_id, ctx);
 
-    // Check if already validated
+    // Verify event ID matches
+    let event_id = object::id(event);
+    assert!(ticket.event_id == event_id, EInvalidEvent);
+
+    // Verify profile matches ticket owner
+    assert!(users::get_owner(user_profile) == ticket.owner, ENotAuthorized);
+
+    // Verify QR code hash
+    assert!(ticket.metadata.qr_code_hash == provided_qr_hash, EInvalidQRHash);
+
+    // Verify not already validated
     assert!(!ticket.validation.is_validated, EAlreadyValidated);
 
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-    let validator = tx_context::sender(ctx);
+    let validator = access_control::get_validator_address(validator_cap);
+    let timestamp = tx_context::epoch_timestamp_ms(ctx);
 
     // Mark as validated
     ticket.validation.is_validated = true;
-    ticket.validation.validation_time = option::some(current_time);
+    ticket.validation.validation_time = option::some(timestamp);
     ticket.validation.validator_address = option::some(validator);
 
-    // Mark attendee as checked in
+    // Check-in attendee
     events::check_in_attendee(event, ticket.owner, ctx);
+
+    // Update user stats and reputation
+    users::increment_events_attended(user_profile, badge_registry, ctx);
 
     event::emit(TicketValidated {
         ticket_id: object::id(ticket),
-        event_id: ticket.event_id,
+        event_id,
         owner: ticket.owner,
         validator,
-        timestamp: current_time,
+        timestamp,
     });
 }
 
-/// Transfer ticket (if allowed by event)
-public fun transfer_ticket(ticket: Ticket, event: &Event, recipient: address, ctx: &TxContext) {
-    // Check if event allows transfers
+/// Transfer ticket to another user
+public fun transfer_ticket(
+    mut ticket: Ticket,
+    event: &mut Event,
+    sender_profile: &mut UserProfile,
+    recipient: address,
+    ctx: &TxContext,
+) {
+    let sender = tx_context::sender(ctx);
+
+    // Verify sender owns profile
+    assert!(users::get_owner(sender_profile) == sender, ENotAuthorized);
+
+    // Verify sender owns ticket
+    assert!(ticket.owner == sender, ENotAuthorized);
+
+    // Verify transferability
     assert!(events::is_transferable(event), ETicketNotTransferable);
-    assert!(ticket.event_id == object::id(event), EInvalidEvent);
 
+    // Verify event ID matches
+    let event_id = object::id(event);
+    assert!(ticket.event_id == event_id, EInvalidEvent);
+
+    // Update ticket owner
     let from = ticket.owner;
-
-    // Update owner
+    let ticket_id = object::id(&ticket);
     ticket.owner = recipient;
 
+    // Update event attendees
+    events::transfer_attendee_registration(event, from, recipient);
+
+    // Update sender stats
+    users::increment_tickets_transferred(sender_profile);
+
     event::emit(TicketTransferred {
-        ticket_id: object::id(&ticket),
+        ticket_id,
+        event_id,
         from,
         to: recipient,
         timestamp: tx_context::epoch_timestamp_ms(ctx),
     });
 
+    // Transfer NFT
     transfer::public_transfer(ticket, recipient);
 }
 
-/// Refund ticket (before event starts)
+/// Refund ticket and destroy it
 public fun refund_ticket(
     ticket: Ticket,
     event: &mut Event,
     pool: &mut TicketPool,
     event_treasury: &mut EventTreasury,
     ctx: &mut TxContext,
-): Payment {
-    // Verify ticket belongs to this event
+) {
+    let sender = tx_context::sender(ctx);
+
+    // Verify ALL conditions BEFORE consuming ticket
+    assert!(ticket.owner == sender, ENotAuthorized);
     assert!(ticket.event_id == object::id(event), EInvalidEvent);
-    assert!(pool.event_id == object::id(event), EInvalidEvent);
-    assert!(ticket.event_id == payments::get_treasury_event_id(event_treasury), EInvalidEvent);
-
-    // Check if refund is allowed
     assert!(events::can_refund(event, ctx), ERefundNotAllowed);
-
-    // Ticket must not be validated
     assert!(!ticket.validation.is_validated, EAlreadyValidated);
 
     let ticket_price = events::get_ticket_price(event);
-    let owner = ticket.owner;
-    let ticket_id = object::id(&ticket);
 
-    // Calculate refund amount (100% for now, can be adjusted)
-    let refund_amount = ticket_price;
-
-    // Issue refund
-    let payment_record = payments::issue_refund(
-        event_treasury,
-        ticket_id,
-        owner,
-        refund_amount,
-        ctx,
+    // CRITICAL: Verify treasury has sufficient balance
+    assert!(
+        payments::get_treasury_balance(event_treasury) >= ticket_price,
+        EInsufficientBalance
     );
 
-    // Unregister attendee
-    events::unregister_attendee(event, owner);
-
-    // Update event stats
-    events::add_refunded(event, refund_amount);
-
-    // Update pool
-    pool.available = pool.available + 1;
-
-    event::emit(TicketRefunded {
-        ticket_id,
-        event_id: ticket.event_id,
-        owner,
-        refund_amount,
-        timestamp: tx_context::epoch_timestamp_ms(ctx),
-    });
-
-    // Destroy ticket
+    // Extract ticket info before destroying
     let Ticket {
-        id,
-        event_id: _,
-        owner: _,
+        id: ticket_id,
+        event_id,
+        owner,
         original_owner: _,
         metadata: _,
         validation: _,
         mint_time: _,
     } = ticket;
-    object::delete(id);
 
-    payment_record
+    let ticket_id_value = object::uid_to_inner(&ticket_id);
+
+    // Issue refund
+    payments::issue_refund(event_treasury, ticket_id_value, owner, ticket_price, ctx);
+
+    // Unregister attendee
+    events::unregister_attendee(event, owner);
+
+    // Update event stats
+    events::add_refunded(event, ticket_price);
+
+    // Update pool
+    pool.available = pool.available + 1;
+
+    event::emit(TicketRefunded {
+        ticket_id: ticket_id_value,
+        event_id,
+        owner,
+        refund_amount: ticket_price,
+        timestamp: tx_context::epoch_timestamp_ms(ctx),
+    });
+
+    // Destroy ticket UID
+    object::delete(ticket_id);
 }
 
-// === View Functions ===
+// ======== Getter Functions ========
 
-/// Get ticket info
-public fun get_ticket_info(ticket: &Ticket): (ID, String, address, u64, bool, u64) {
-    (
-        ticket.event_id,
-        ticket.metadata.tier,
-        ticket.owner,
-        ticket.mint_time,
-        ticket.validation.is_validated,
-        ticket.metadata.ticket_number,
-    )
+public fun get_event_id(ticket: &Ticket): ID {
+    ticket.event_id
 }
 
-/// Get ticket metadata
-public fun get_ticket_metadata(ticket: &Ticket): &TicketMetadata {
-    &ticket.metadata
-}
-
-/// Get validation info
-public fun get_validation_info(ticket: &Ticket): (bool, Option<u64>, Option<address>) {
-    (
-        ticket.validation.is_validated,
-        ticket.validation.validation_time,
-        ticket.validation.validator_address,
-    )
-}
-
-/// Check if ticket is validated
-public fun is_validated(ticket: &Ticket): bool {
-    ticket.validation.is_validated
-}
-
-/// Get ticket owner
 public fun get_owner(ticket: &Ticket): address {
     ticket.owner
 }
 
-/// Get original owner
 public fun get_original_owner(ticket: &Ticket): address {
     ticket.original_owner
 }
 
-/// Get ticket number
+public fun is_validated(ticket: &Ticket): bool {
+    ticket.validation.is_validated
+}
+
 public fun get_ticket_number(ticket: &Ticket): u64 {
     ticket.metadata.ticket_number
 }
 
-/// Get encrypted data
-public fun get_encrypted_data(ticket: &Ticket): &vector<u8> {
-    &ticket.metadata.encrypted_data
+public fun get_tier(ticket: &Ticket): String {
+    ticket.metadata.tier
 }
 
-/// Get QR code hash
-public fun get_qr_code_hash(ticket: &Ticket): &vector<u8> {
-    &ticket.metadata.qr_code_hash
+public fun get_pool_total_minted(pool: &TicketPool): u64 {
+    pool.total_minted
 }
 
-/// Get pool stats
-public fun get_pool_stats(pool: &TicketPool): (u64, u64) {
-    (pool.total_minted, pool.available)
+public fun get_pool_available(pool: &TicketPool): u64 {
+    pool.available
 }
 
-/// Get pool event ID
-public fun get_pool_event_id(pool: &TicketPool): ID {
-    pool.event_id
+public fun get_validation_time(ticket: &Ticket): &Option<u64> {
+    &ticket.validation.validation_time
 }
 
-// === Test Functions ===
-#[test_only]
-public fun create_test_ticket(
-    event_id: ID,
-    owner: address,
-    ticket_number: u64,
-    ctx: &mut TxContext,
-): Ticket {
-    let metadata = TicketMetadata {
-        ticket_number,
-        tier: std::string::utf8(b"General"),
-        encrypted_data: std::vector::empty(),
-        seal_key_id: std::string::utf8(b"test_key"),
-        qr_code_hash: std::vector::empty(),
-    };
-
-    let validation = ValidationInfo {
-        is_validated: false,
-        validation_time: option::none(),
-        validator_address: option::none(),
-    };
-
-    Ticket {
-        id: object::new(ctx),
-        event_id,
-        owner,
-        original_owner: owner,
-        metadata,
-        validation,
-        mint_time: tx_context::epoch_timestamp_ms(ctx),
-    }
+public fun get_validator_address(ticket: &Ticket): &Option<address> {
+    &ticket.validation.validator_address
 }

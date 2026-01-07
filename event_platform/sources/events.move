@@ -1,48 +1,37 @@
 /// Events Module
-/// Core event creation, registration, and lifecycle management
+/// Core event entity and lifecycle management
 module event_platform::events;
 
-use event_platform::access_control::{Self, EventOrganizerCap};
 use std::string::String;
 use sui::event;
-use sui::object::{Self, UID, ID};
 use sui::table::{Self, Table};
-use sui::transfer;
-use sui::tx_context::{Self, TxContext};
+use event_platform::access_control::{Self, EventOrganizerCap};
+use event_platform::users::{Self, UserProfile, BadgeRegistry};
+use event_platform::payments::{Self, EventTreasury};
 
-// === Error Codes ===
-const ENotAuthorized: u64 = 1;
-const EEventFull: u64 = 2;
-const EInvalidTime: u64 = 3;
-const EInvalidStatus: u64 = 4;
-const EInvalidTransition: u64 = 5;
-const ERegistrationClosed: u64 = 6;
-const EEventAlreadyStarted: u64 = 7;
+// ======== Error Codes ========
+const ENotAuthorized: u64 = 3000;
+const EInvalidTime: u64 = 3001;
+const EInvalidStatus: u64 = 3002;
+const EEventFull: u64 = 3003;
+const ERegistrationClosed: u64 = 3004;
+const EEventAlreadyStarted: u64 = 3005;
+const EAlreadyRegistered: u64 = 3007;
+const ENotRegistered: u64 = 3008;
+const EAlreadyCheckedIn: u64 = 3009;
+const EInvalidCapacity: u64 = 3010;
 
-// === Constants ===
+// ======== Status Constants ========
 const STATUS_DRAFT: u8 = 0;
 const STATUS_OPEN: u8 = 1;
 const STATUS_IN_PROGRESS: u8 = 2;
 const STATUS_COMPLETED: u8 = 3;
 const STATUS_CANCELLED: u8 = 4;
 
-const PLATFORM_FEE_PERCENT: u64 = 5; // 5% platform fee
+// ======== Structs ========
 
-// === One-Time-Witness ===
-public struct EVENTS has drop {}
-
-// === Main Structs ===
-
-/// Shared registry (one per platform)
-public struct EventRegistry has key {
-    id: UID,
-    total_events: u64,
-    platform_fee_percent: u64,
-    admin: address,
-}
-
-/// Main Event object (shared)
-public struct Event has key, store {
+/// Main event object (SHARED)
+public struct Event has key {
     id: UID,
     organizer: address,
     metadata: EventMetadata,
@@ -50,26 +39,20 @@ public struct Event has key, store {
     stats: EventStats,
     status: u8,
     attendees: Table<address, AttendeeInfo>,
+    created_at: u64,
+    updated_at: u64,
 }
 
-/// Attendee information
-public struct AttendeeInfo has drop, store {
-    registered_at: u64,
-    checked_in: bool,
-    check_in_time: Option<u64>,
-}
-
-/// Nested metadata
-public struct EventMetadata has drop, store {
+public struct EventMetadata has store, drop {
     title: String,
     description: String,
     walrus_blob_id: String,
     image_url: String,
+    category: String,
     tags: vector<String>,
 }
 
-/// Nested configuration
-public struct EventConfig has drop, store {
+public struct EventConfig has store, drop {
     start_time: u64,
     end_time: u64,
     registration_deadline: u64,
@@ -80,7 +63,6 @@ public struct EventConfig has drop, store {
     refund_deadline: u64,
 }
 
-/// Copyable event statistics
 public struct EventStats has copy, drop, store {
     registered: u64,
     attended: u64,
@@ -88,11 +70,27 @@ public struct EventStats has copy, drop, store {
     refunded: u64,
 }
 
-// === Event Logs ===
+public struct AttendeeInfo has store, drop {
+    registered_at: u64,
+    checked_in: bool,
+    check_in_time: Option<u64>,
+}
+
+/// Event registry for discovery (SHARED)
+public struct EventRegistry has key {
+    id: UID,
+    total_events: u64,
+    platform_fee_percent: u64,
+    events_by_category: Table<String, vector<ID>>,
+}
+
+// ======== Events ========
 
 public struct EventCreated has copy, drop {
     event_id: ID,
     organizer: address,
+    title: String,
+    category: String,
     timestamp: u64,
 }
 
@@ -112,162 +110,157 @@ public struct EventCancelled has copy, drop {
     timestamp: u64,
 }
 
-public struct EventStatusChanged has copy, drop {
+public struct EventStarted has copy, drop {
     event_id: ID,
-    old_status: u8,
-    new_status: u8,
     timestamp: u64,
 }
 
-public struct RegistrationClosed has copy, drop {
+public struct EventCompleted has copy, drop {
     event_id: ID,
-    final_count: u64,
+    total_attended: u64,
     timestamp: u64,
 }
 
-// === Init Function ===
+public struct AttendeeRegistered has copy, drop {
+    event_id: ID,
+    attendee: address,
+    timestamp: u64,
+}
 
-/// Initialize the module with a shared registry
-fun init(_witness: EVENTS, ctx: &mut TxContext) {
+public struct AttendeeCheckedIn has copy, drop {
+    event_id: ID,
+    attendee: address,
+    timestamp: u64,
+}
+
+// ======== Init Function ========
+
+fun init(ctx: &mut TxContext) {
     let registry = EventRegistry {
         id: object::new(ctx),
         total_events: 0,
-        platform_fee_percent: PLATFORM_FEE_PERCENT,
-        admin: tx_context::sender(ctx),
+        platform_fee_percent: 250,  // 2.5% fixed
+        events_by_category: table::new(ctx),
     };
     transfer::share_object(registry);
 }
 
-// === Public Functions ===
+// ======== Public Functions ========
 
-/// Create a new event in DRAFT status
+/// Create a new event
 public fun create_event(
     registry: &mut EventRegistry,
+    user_profile: &mut UserProfile,
+    badge_registry: &mut BadgeRegistry,
     metadata: EventMetadata,
     config: EventConfig,
     ctx: &mut TxContext,
-): EventOrganizerCap {
+): (EventOrganizerCap, EventTreasury) {
+    let sender = tx_context::sender(ctx);
+
+    // Validate profile owner
+    assert!(users::get_owner(user_profile) == sender, ENotAuthorized);
+
     // Validate times
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-    assert!(config.start_time > current_time, EInvalidTime);
+    let now = tx_context::epoch_timestamp_ms(ctx);
+    assert!(config.start_time > now, EInvalidTime);
     assert!(config.end_time > config.start_time, EInvalidTime);
     assert!(config.registration_deadline <= config.start_time, EInvalidTime);
-    assert!(config.registration_deadline > current_time, EInvalidTime);
     assert!(config.refund_deadline <= config.start_time, EInvalidTime);
+    assert!(config.capacity > 0, EInvalidCapacity);
 
-    // Create event stats
-    let stats = EventStats {
-        registered: 0,
-        attended: 0,
-        revenue: 0,
-        refunded: 0,
-    };
+    // Create Event object
+    let event_id = object::new(ctx);
+    let event_id_value = object::uid_to_inner(&event_id);
 
-    // Create event object
-    let event_uid = object::new(ctx);
-    let event_id = object::uid_to_inner(&event_uid);
-
-    let event_obj = Event {
-        id: event_uid,
-        organizer: tx_context::sender(ctx),
+    let event = Event {
+        id: event_id,
+        organizer: sender,
         metadata,
         config,
-        stats,
+        stats: EventStats {
+            registered: 0,
+            attended: 0,
+            revenue: 0,
+            refunded: 0,
+        },
         status: STATUS_DRAFT,
         attendees: table::new(ctx),
+        created_at: now,
+        updated_at: now,
     };
 
-    // Share the event object
-    transfer::share_object(event_obj);
+    // Share Event object
+    let category = event.metadata.category;
+    let title = event.metadata.title;
 
-    // Update registry
+    event::emit(EventCreated {
+        event_id: event_id_value,
+        organizer: sender,
+        title,
+        category,
+        timestamp: now,
+    });
+
+    // Add to category index
+    if (!table::contains(&registry.events_by_category, category)) {
+        table::add(&mut registry.events_by_category, category, vector::empty());
+    };
+    let category_events = table::borrow_mut(&mut registry.events_by_category, category);
+    vector::push_back(category_events, event_id_value);
+
     registry.total_events = registry.total_events + 1;
 
-    // Emit event
-    event::emit(EventCreated {
-        event_id,
-        organizer: tx_context::sender(ctx),
-        timestamp: current_time,
-    });
+    transfer::share_object(event);
 
-    // Grant organizer capability
-    access_control::grant_organizer_cap(event_id, ctx)
+    // Update UserProfile stats
+    users::increment_events_created(user_profile, badge_registry, ctx);
+
+    // Create EventTreasury
+    let treasury = payments::create_event_treasury(event_id_value, sender, ctx);
+
+    // Grant EventOrganizerCap
+    let cap = access_control::create_organizer_cap(event_id_value, ctx);
+
+    (cap, treasury)
 }
 
-/// Publish event (change status from DRAFT to OPEN)
-public fun publish_event(event: &mut Event, cap: &EventOrganizerCap, ctx: &TxContext) {
-    // Verify ownership
-    assert!(access_control::verify_organizer(cap, object::id(event)), ENotAuthorized);
+/// Publish event (change from DRAFT to OPEN)
+public fun publish_event(
+    event: &mut Event,
+    cap: &EventOrganizerCap,
+    ctx: &TxContext,
+) {
+    let event_id = object::id(event);
+    access_control::verify_organizer(cap, event_id, ctx);
 
-    // Verify current status is DRAFT
-    assert!(event.status == STATUS_DRAFT, EInvalidTransition);
+    assert!(event.status == STATUS_DRAFT, EInvalidStatus);
 
-    // Verify registration deadline hasn't passed
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-    assert!(current_time < event.config.registration_deadline, EInvalidTime);
-
-    let old_status = event.status;
     event.status = STATUS_OPEN;
-
-    event::emit(EventStatusChanged {
-        event_id: object::id(event),
-        old_status,
-        new_status: STATUS_OPEN,
-        timestamp: current_time,
-    });
+    event.updated_at = tx_context::epoch_timestamp_ms(ctx);
 
     event::emit(EventPublished {
-        event_id: object::id(event),
-        timestamp: current_time,
+        event_id,
+        timestamp: event.updated_at,
     });
 }
 
-/// Update event metadata (only if not started)
+/// Update event metadata
 public fun update_event(
     event: &mut Event,
     cap: &EventOrganizerCap,
     new_metadata: EventMetadata,
     ctx: &TxContext,
 ) {
-    // Verify ownership and permission
-    assert!(access_control::verify_can_update(cap, object::id(event)), ENotAuthorized);
-
-    // Cannot update if event has started
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-    assert!(current_time < event.config.start_time, EEventAlreadyStarted);
+    let event_id = object::id(event);
+    access_control::verify_can_update(cap, event_id, ctx);
 
     event.metadata = new_metadata;
+    event.updated_at = tx_context::epoch_timestamp_ms(ctx);
 
     event::emit(EventUpdated {
-        event_id: object::id(event),
-        timestamp: current_time,
-    });
-}
-
-/// Update event configuration (only if not started)
-public fun update_event_config(
-    event: &mut Event,
-    cap: &EventOrganizerCap,
-    new_config: EventConfig,
-    ctx: &TxContext,
-) {
-    // Verify ownership and permission
-    assert!(access_control::verify_can_update(cap, object::id(event)), ENotAuthorized);
-
-    // Cannot update if event has started
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-    assert!(current_time < event.config.start_time, EEventAlreadyStarted);
-
-    // Validate new times
-    assert!(new_config.start_time > current_time, EInvalidTime);
-    assert!(new_config.end_time > new_config.start_time, EInvalidTime);
-    assert!(new_config.registration_deadline <= new_config.start_time, EInvalidTime);
-
-    event.config = new_config;
-
-    event::emit(EventUpdated {
-        event_id: object::id(event),
-        timestamp: current_time,
+        event_id,
+        timestamp: event.updated_at,
     });
 }
 
@@ -276,190 +269,208 @@ public fun cancel_event(
     event: &mut Event,
     cap: &EventOrganizerCap,
     reason: String,
+    user_profile: &mut UserProfile,
     ctx: &TxContext,
 ) {
-    // Verify ownership and permission
-    assert!(access_control::verify_can_cancel(cap, object::id(event)), ENotAuthorized);
+    let event_id = object::id(event);
+    access_control::verify_can_cancel(cap, event_id, ctx);
 
-    // Cannot cancel if already completed
-    assert!(event.status != STATUS_COMPLETED, EInvalidTransition);
-    assert!(event.status != STATUS_CANCELLED, EInvalidTransition);
+    // Can only cancel before event starts
+    let now = tx_context::epoch_timestamp_ms(ctx);
+    assert!(now < event.config.start_time, EEventAlreadyStarted);
 
-    let old_status = event.status;
     event.status = STATUS_CANCELLED;
-
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-
-    event::emit(EventStatusChanged {
-        event_id: object::id(event),
-        old_status,
-        new_status: STATUS_CANCELLED,
-        timestamp: current_time,
-    });
+    event.updated_at = now;
 
     event::emit(EventCancelled {
-        event_id: object::id(event),
+        event_id,
         reason,
-        timestamp: current_time,
+        timestamp: now,
     });
+
+    // Apply penalty to organizer
+    users::apply_cancellation_penalty(user_profile, ctx);
 }
 
-/// Close registration manually
-public fun close_registration(event: &mut Event, cap: &EventOrganizerCap, ctx: &TxContext) {
-    // Verify ownership
-    assert!(access_control::verify_organizer(cap, object::id(event)), ENotAuthorized);
+/// Start event (manual or automatic)
+public fun start_event(
+    event: &mut Event,
+    cap: &EventOrganizerCap,
+    ctx: &TxContext,
+) {
+    let event_id = object::id(event);
+    access_control::verify_organizer(cap, event_id, ctx);
 
-    // Must be OPEN to close
-    assert!(event.status == STATUS_OPEN, EInvalidTransition);
+    assert!(event.status == STATUS_OPEN, EInvalidStatus);
 
-    let old_status = event.status;
+    let now = tx_context::epoch_timestamp_ms(ctx);
+    assert!(now >= event.config.start_time, EInvalidTime);
+
     event.status = STATUS_IN_PROGRESS;
+    event.updated_at = now;
 
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-
-    event::emit(EventStatusChanged {
-        event_id: object::id(event),
-        old_status,
-        new_status: STATUS_IN_PROGRESS,
-        timestamp: current_time,
-    });
-
-    event::emit(RegistrationClosed {
-        event_id: object::id(event),
-        final_count: event.stats.registered,
-        timestamp: current_time,
+    event::emit(EventStarted {
+        event_id,
+        timestamp: now,
     });
 }
 
-/// Mark event as completed
-public fun complete_event(event: &mut Event, cap: &EventOrganizerCap, ctx: &TxContext) {
-    // Verify ownership
-    assert!(access_control::verify_organizer(cap, object::id(event)), ENotAuthorized);
+/// Complete event
+public fun complete_event(
+    event: &mut Event,
+    cap: &EventOrganizerCap,
+    ctx: &TxContext,
+) {
+    let event_id = object::id(event);
+    access_control::verify_organizer(cap, event_id, ctx);
 
-    // Must be IN_PROGRESS
-    assert!(event.status == STATUS_IN_PROGRESS, EInvalidTransition);
+    assert!(event.status == STATUS_IN_PROGRESS, EInvalidStatus);
 
-    // Event should have ended
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-    assert!(current_time >= event.config.end_time, EInvalidTime);
+    let now = tx_context::epoch_timestamp_ms(ctx);
+    assert!(now >= event.config.end_time, EInvalidTime);
 
-    let old_status = event.status;
     event.status = STATUS_COMPLETED;
+    event.updated_at = now;
 
-    event::emit(EventStatusChanged {
-        event_id: object::id(event),
-        old_status,
-        new_status: STATUS_COMPLETED,
-        timestamp: current_time,
+    event::emit(EventCompleted {
+        event_id,
+        total_attended: event.stats.attended,
+        timestamp: now,
     });
 }
 
-/// Register attendee (internal function for tickets module)
-public(package) fun register_attendee(event: &mut Event, attendee: address, ctx: &TxContext) {
-    // Check status
+// ======== Package Functions ========
+
+/// Register attendee (called by tickets module)
+public(package) fun register_attendee(
+    event: &mut Event,
+    attendee: address,
+    ctx: &TxContext,
+) {
     assert!(event.status == STATUS_OPEN, ERegistrationClosed);
-
-    // Check capacity
     assert!(event.stats.registered < event.config.capacity, EEventFull);
+    assert!(!table::contains(&event.attendees, attendee), EAlreadyRegistered);
 
-    // Check if already registered
-    assert!(!table::contains(&event.attendees, attendee), ENotAuthorized);
+    let now = tx_context::epoch_timestamp_ms(ctx);
+    assert!(now <= event.config.registration_deadline, ERegistrationClosed);
 
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-
-    // Add attendee
     let attendee_info = AttendeeInfo {
-        registered_at: current_time,
+        registered_at: now,
         checked_in: false,
-        check_in_time: std::option::none(),
+        check_in_time: option::none(),
     };
-    table::add(&mut event.attendees, attendee, attendee_info);
 
-    // Update stats
+    table::add(&mut event.attendees, attendee, attendee_info);
     event.stats.registered = event.stats.registered + 1;
+    event.updated_at = now;
+
+    event::emit(AttendeeRegistered {
+        event_id: object::id(event),
+        attendee,
+        timestamp: now,
+    });
 }
 
-/// Mark attendee as checked in (internal function for tickets module)
-public(package) fun check_in_attendee(event: &mut Event, attendee: address, ctx: &TxContext) {
-    assert!(table::contains(&event.attendees, attendee), ENotAuthorized);
+/// Unregister attendee (for refunds)
+public(package) fun unregister_attendee(event: &mut Event, attendee: address) {
+    assert!(table::contains(&event.attendees, attendee), ENotRegistered);
+
+    let attendee_info = table::remove(&mut event.attendees, attendee);
+
+    // Only allow unregister if not checked in
+    assert!(!attendee_info.checked_in, EAlreadyCheckedIn);
+
+    event.stats.registered = event.stats.registered - 1;
+}
+
+/// Check in attendee
+public(package) fun check_in_attendee(
+    event: &mut Event,
+    attendee: address,
+    ctx: &TxContext,
+) {
+    assert!(table::contains(&event.attendees, attendee), ENotRegistered);
 
     let attendee_info = table::borrow_mut(&mut event.attendees, attendee);
+    assert!(!attendee_info.checked_in, EAlreadyCheckedIn);
 
-    if (!attendee_info.checked_in) {
-        attendee_info.checked_in = true;
-        attendee_info.check_in_time = std::option::some(tx_context::epoch_timestamp_ms(ctx));
-        event.stats.attended = event.stats.attended + 1;
-    };
+    let now = tx_context::epoch_timestamp_ms(ctx);
+    attendee_info.checked_in = true;
+    attendee_info.check_in_time = option::some(now);
+
+    event.stats.attended = event.stats.attended + 1;
+    event.updated_at = now;
+
+    event::emit(AttendeeCheckedIn {
+        event_id: object::id(event),
+        attendee,
+        timestamp: now,
+    });
 }
 
-/// Unregister attendee (for refunds - internal function)
-public(package) fun unregister_attendee(event: &mut Event, attendee: address) {
-    if (table::contains(&event.attendees, attendee)) {
-        table::remove(&mut event.attendees, attendee);
-        if (event.stats.registered > 0) {
-            event.stats.registered = event.stats.registered - 1;
-        };
-    };
-}
-
-/// Add revenue to event stats (internal function for payments module)
+/// Add revenue to stats
 public(package) fun add_revenue(event: &mut Event, amount: u64) {
     event.stats.revenue = event.stats.revenue + amount;
 }
 
-/// Add refunded amount to stats (internal function for payments module)
+/// Add refunded amount to stats
 public(package) fun add_refunded(event: &mut Event, amount: u64) {
     event.stats.refunded = event.stats.refunded + amount;
 }
 
-// === View Functions ===
+/// Transfer attendee registration (for ticket transfers)
+public(package) fun transfer_attendee_registration(
+    event: &mut Event,
+    from: address,
+    to: address,
+) {
+    assert!(table::contains(&event.attendees, from), ENotRegistered);
+    assert!(!table::contains(&event.attendees, to), EAlreadyRegistered);
 
-/// Get event status
-public fun get_event_status(event: &Event): u8 {
+    let attendee_info = table::remove(&mut event.attendees, from);
+    table::add(&mut event.attendees, to, attendee_info);
+}
+
+// ======== View Functions ========
+
+public fun get_status(event: &Event): u8 {
     event.status
 }
 
-/// Get event details
-public fun get_event_info(event: &Event): (String, String, u64, u64, u64, u64, u8) {
-    (
-        event.metadata.title,
-        event.metadata.description,
-        event.config.start_time,
-        event.config.end_time,
-        event.config.capacity,
-        event.stats.registered,
-        event.status,
-    )
+public fun is_open(event: &Event): bool {
+    event.status == STATUS_OPEN
 }
 
-/// Get event statistics
-public fun get_event_stats(event: &Event): (u64, u64, u64, u64) {
-    (event.stats.registered, event.stats.attended, event.stats.revenue, event.stats.refunded)
+public fun is_full(event: &Event): bool {
+    event.stats.registered >= event.config.capacity
 }
 
-/// Get event configuration
-public fun get_event_config(event: &Event): &EventConfig {
-    &event.config
+public fun can_register(event: &Event, ctx: &TxContext): bool {
+    let now = tx_context::epoch_timestamp_ms(ctx);
+    event.status == STATUS_OPEN &&
+    event.stats.registered < event.config.capacity &&
+    now <= event.config.registration_deadline
 }
 
-/// Get event metadata
-public fun get_event_metadata(event: &Event): &EventMetadata {
-    &event.metadata
+public fun get_ticket_price(event: &Event): u64 {
+    event.config.ticket_price
 }
 
-/// Check if registration is open
-public fun is_registration_open(event: &Event, ctx: &TxContext): bool {
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-    event.status == STATUS_OPEN && current_time < event.config.registration_deadline
+public fun is_transferable(event: &Event): bool {
+    event.config.is_transferable
 }
 
-/// Check if attendee is registered
-public fun is_registered(event: &Event, attendee: address): bool {
+public fun can_refund(event: &Event, ctx: &TxContext): bool {
+    let now = tx_context::epoch_timestamp_ms(ctx);
+    event.status == STATUS_OPEN &&
+    now <= event.config.refund_deadline
+}
+
+public fun is_attendee_registered(event: &Event, attendee: address): bool {
     table::contains(&event.attendees, attendee)
 }
 
-/// Check if attendee is checked in
-public fun is_checked_in(event: &Event, attendee: address): bool {
+public fun is_attendee_checked_in(event: &Event, attendee: address): bool {
     if (table::contains(&event.attendees, attendee)) {
         let attendee_info = table::borrow(&event.attendees, attendee);
         attendee_info.checked_in
@@ -468,86 +479,42 @@ public fun is_checked_in(event: &Event, attendee: address): bool {
     }
 }
 
-/// Get attendee info
-public fun get_attendee_info(event: &Event, attendee: address): (u64, bool, Option<u64>) {
-    assert!(table::contains(&event.attendees, attendee), ENotAuthorized);
-    let info = table::borrow(&event.attendees, attendee);
-    (info.registered_at, info.checked_in, info.check_in_time)
-}
-
-/// Get registry info
-public fun get_registry_info(registry: &EventRegistry): (u64, u64) {
-    (registry.total_events, registry.platform_fee_percent)
-}
-
-/// Get event organizer
 public fun get_organizer(event: &Event): address {
     event.organizer
 }
 
-/// Get ticket price
-public fun get_ticket_price(event: &Event): u64 {
-    event.config.ticket_price
+public fun get_capacity(event: &Event): u64 {
+    event.config.capacity
 }
 
-/// Check if event is transferable
-public fun is_transferable(event: &Event): bool {
-    event.config.is_transferable
+public fun get_registered_count(event: &Event): u64 {
+    event.stats.registered
 }
 
-/// Get refund deadline
-public fun get_refund_deadline(event: &Event): u64 {
-    event.config.refund_deadline
+public fun get_attended_count(event: &Event): u64 {
+    event.stats.attended
 }
 
-/// Check if refund is allowed
-public fun can_refund(event: &Event, ctx: &TxContext): bool {
-    let current_time = tx_context::epoch_timestamp_ms(ctx);
-    current_time < event.config.refund_deadline && event.status != STATUS_CANCELLED
+public fun get_start_time(event: &Event): u64 {
+    event.config.start_time
 }
 
-/// Create event metadata
-public fun create_metadata(
-    title: String,
-    description: String,
-    walrus_blob_id: String,
-    image_url: String,
-    tags: vector<String>,
-): EventMetadata {
-    EventMetadata {
-        title,
-        description,
-        walrus_blob_id,
-        image_url,
-        tags,
-    }
+public fun get_end_time(event: &Event): u64 {
+    event.config.end_time
 }
 
-/// Create event configuration
-public fun create_config(
-    start_time: u64,
-    end_time: u64,
-    registration_deadline: u64,
-    capacity: u64,
-    ticket_price: u64,
-    requires_approval: bool,
-    is_transferable: bool,
-    refund_deadline: u64,
-): EventConfig {
-    EventConfig {
-        start_time,
-        end_time,
-        registration_deadline,
-        capacity,
-        ticket_price,
-        requires_approval,
-        is_transferable,
-        refund_deadline,
-    }
+public fun get_title(event: &Event): String {
+    event.metadata.title
 }
 
-// === Test Functions ===
-#[test_only]
-public fun init_for_testing(ctx: &mut TxContext) {
-    init(EVENTS {}, ctx);
+public fun get_category(event: &Event): String {
+    event.metadata.category
+}
+
+public fun get_platform_fee_percent(registry: &EventRegistry): u64 {
+    registry.platform_fee_percent
+}
+
+public fun get_total_events(registry: &EventRegistry): u64 {
+    registry.total_events
 }
