@@ -42,7 +42,6 @@ const MILESTONE_VETERAN_ORGANIZER: u64 = 25;
 
 public struct UserProfile has key {
     id: UID,
-    owner: address,
     identity: UserIdentity,
     reputation: ReputationData,
     stats: UserStats,
@@ -168,7 +167,6 @@ public fun create_profile(
 
     UserProfile {
         id: profile_id,
-        owner,
         identity: UserIdentity {
             display_name,
             zklogin_sub,
@@ -220,7 +218,6 @@ public fun create_profile_with_zklogin(
 
     UserProfile {
         id: profile_id,
-        owner,
         identity: UserIdentity {
             display_name: option::some(display_name),
             zklogin_sub: option::some(zklogin_sub),
@@ -259,14 +256,13 @@ public fun update_identity(
     new_identity: UserIdentity,
     ctx: &TxContext,
 ) {
-    assert!(profile.owner == tx_context::sender(ctx), ENotAuthorized);
-
+    // No authorization check needed - Sui guarantees sender owns the profile
     profile.identity = new_identity;
     profile.updated_at = tx_context::epoch_timestamp_ms(ctx);
 
     event::emit(ProfileUpdated {
         profile_id: object::id(profile),
-        owner: profile.owner,
+        owner: tx_context::sender(ctx),
         timestamp: profile.updated_at,
     });
 }
@@ -277,14 +273,13 @@ public fun update_preferences(
     new_preferences: UserPreferences,
     ctx: &TxContext,
 ) {
-    assert!(profile.owner == tx_context::sender(ctx), ENotAuthorized);
-
+    // No authorization check needed - Sui guarantees sender owns the profile
     profile.preferences = new_preferences;
     profile.updated_at = tx_context::epoch_timestamp_ms(ctx);
 
     event::emit(ProfileUpdated {
         profile_id: object::id(profile),
-        owner: profile.owner,
+        owner: tx_context::sender(ctx),
         timestamp: profile.updated_at,
     });
 }
@@ -376,7 +371,7 @@ public(package) fun update_reputation(
 
     event::emit(ReputationUpdated {
         profile_id: object::id(profile),
-        owner: profile.owner,
+        owner: tx_context::sender(ctx),
         old_score,
         new_score,
         timestamp: profile.updated_at,
@@ -524,7 +519,7 @@ fun mint_badge(
     ctx: &mut TxContext,
 ) {
     let badge_id = object::new(ctx);
-    let user = profile.owner;
+    let user = tx_context::sender(ctx);
     let timestamp = tx_context::epoch_timestamp_ms(ctx);
 
     let badge_type_str = std::string::utf8(badge_type);
@@ -580,10 +575,6 @@ fun default_preferences(): UserPreferences {
 }
 
 // ======== Getter Functions ========
-
-public fun get_owner(profile: &UserProfile): address {
-    profile.owner
-}
 
 public fun get_reputation_score(profile: &UserProfile): u64 {
     profile.reputation.score

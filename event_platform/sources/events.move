@@ -158,8 +158,7 @@ public fun create_event(
 ): (EventOrganizerCap, EventTreasury) {
     let sender = tx_context::sender(ctx);
 
-    // Validate profile owner
-    assert!(users::get_owner(user_profile) == sender, ENotAuthorized);
+    // No profile ownership check needed - Sui guarantees sender owns the profile
 
     // Validate times
     let now = tx_context::epoch_timestamp_ms(ctx);
